@@ -34,9 +34,11 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/garyburd/redigo/redis"
+	"github.com/FZambia/sentinel"
+	"github.com/gomodule/redigo/redis"
 
 	"github.com/astaxie/beego/cache"
 )
@@ -50,6 +52,7 @@ var (
 type Cache struct {
 	p        *redis.Pool // redis connection pool
 	conninfo string
+	master   string
 	dbNum    int
 	key      string
 	password string
@@ -169,6 +172,12 @@ func (rc *Cache) StartAndGC(config string) error {
 	if _, ok := cf["password"]; !ok {
 		cf["password"] = ""
 	}
+
+	if _, ok := cf["master"]; !ok {
+		cf["master"] = "mymaster"
+	}
+
+	rc.master = cf["master"]
 	rc.key = cf["key"]
 	rc.conninfo = cf["conn"]
 	rc.dbNum, _ = strconv.Atoi(cf["dbNum"])
@@ -184,31 +193,62 @@ func (rc *Cache) StartAndGC(config string) error {
 
 // connect to redis.
 func (rc *Cache) connectInit() {
-	dialFunc := func() (c redis.Conn, err error) {
-		c, err = redis.Dial("tcp", rc.conninfo)
-		if err != nil {
-			return nil, err
-		}
+	var conn []string
+	if strings.Contains(rc.conninfo, ",") {
+		conn = strings.Split(rc.conninfo, ",")
 
-		if rc.password != "" {
-			if _, err := c.Do("AUTH", rc.password); err != nil {
-				c.Close()
+	} else {
+
+		conn = []string{rc.conninfo}
+	}
+	sntnl := &sentinel.Sentinel{
+		Addrs:      conn,
+		MasterName: rc.master,
+		Dial: func(addr string) (redis.Conn, error) {
+			timeout := 500 * time.Millisecond
+			c, err := redis.DialTimeout("tcp", addr, timeout, timeout, timeout)
+			if err != nil {
 				return nil, err
 			}
-		}
-
-		_, selecterr := c.Do("SELECT", rc.dbNum)
-		if selecterr != nil {
-			c.Close()
-			return nil, selecterr
-		}
-		return
+			return c, nil
+		},
 	}
-	// initialize a new pool
 	rc.p = &redis.Pool{
 		MaxIdle:     3,
-		IdleTimeout: 180 * time.Second,
-		Dial:        dialFunc,
+		MaxActive:   64,
+		Wait:        true,
+		IdleTimeout: 240 * time.Second,
+		Dial: func() (redis.Conn, error) {
+			masterAddr, err := sntnl.MasterAddr()
+			if err != nil {
+				return nil, err
+			}
+			c, err := redis.Dial("tcp", masterAddr)
+			if err != nil {
+				return nil, err
+			}
+
+			if rc.password != "" {
+				if _, err := c.Do("AUTH", rc.password); err != nil {
+					c.Close()
+					return nil, err
+				}
+			}
+
+			_, selecterr := c.Do("SELECT", rc.dbNum)
+			if selecterr != nil {
+				c.Close()
+				return nil, selecterr
+			}
+			return c, nil
+		},
+		TestOnBorrow: func(c redis.Conn, t time.Time) error {
+			if !sentinel.TestRole(c, "master") {
+				return errors.New("Role check failed")
+			} else {
+				return nil
+			}
+		},
 	}
 }
 
