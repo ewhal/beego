@@ -37,8 +37,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/FZambia/sentinel"
-	"github.com/gomodule/redigo/redis"
+	"github.com/go-redis/redis"
 
 	"github.com/astaxie/beego/cache"
 )
@@ -50,9 +49,8 @@ var (
 
 // Cache is Redis cache adapter.
 type Cache struct {
-	p        *redis.Pool // redis connection pool
+	p        *redis.Client // redis connection pool
 	conninfo string
-	master   string
 	dbNum    int
 	key      string
 	password string
@@ -63,18 +61,6 @@ func NewRedisCache() cache.Cache {
 	return &Cache{key: DefaultKey}
 }
 
-// actually do the redis cmds, args[0] must be the key name.
-func (rc *Cache) do(commandName string, args ...interface{}) (reply interface{}, err error) {
-	if len(args) < 1 {
-		return nil, errors.New("missing required arguments")
-	}
-	args[0] = rc.associate(args[0])
-	c := rc.p.Get()
-	defer c.Close()
-
-	return c.Do(commandName, args...)
-}
-
 // associate with config key.
 func (rc *Cache) associate(originKey interface{}) string {
 	return fmt.Sprintf("%s:%s", rc.key, originKey)
@@ -82,74 +68,60 @@ func (rc *Cache) associate(originKey interface{}) string {
 
 // Get cache from redis.
 func (rc *Cache) Get(key string) interface{} {
-	if v, err := rc.do("GET", key); err == nil {
-		return v
+	if err := rc.p.Get(key).Err(); err == nil {
+		if v, err := rc.p.Get(key).Bytes(); err == nil {
+			return v
+		}
+		return nil
+
 	}
 	return nil
 }
 
 // GetMulti get cache from redis.
 func (rc *Cache) GetMulti(keys []string) []interface{} {
-	c := rc.p.Get()
-	defer c.Close()
-	var args []interface{}
-	for _, key := range keys {
-		args = append(args, rc.associate(key))
+	if v, err := rc.p.MGet(strings.Join(keys, " ")).Result(); err == nil {
+		return v
 	}
-	values, err := redis.Values(c.Do("MGET", args...))
-	if err != nil {
-		return nil
-	}
-	return values
+	return nil
 }
 
 // Put put cache to redis.
 func (rc *Cache) Put(key string, val interface{}, timeout time.Duration) error {
-	_, err := rc.do("SETEX", key, int64(timeout/time.Second), val)
-	return err
+	return rc.p.Set(key, val, timeout).Err()
 }
 
 // Delete delete cache in redis.
 func (rc *Cache) Delete(key string) error {
-	_, err := rc.do("DEL", key)
-	return err
+	return rc.p.Del(key).Err()
 }
 
 // IsExist check cache's existence in redis.
 func (rc *Cache) IsExist(key string) bool {
-	v, err := redis.Bool(rc.do("EXISTS", key))
+
+	val, err := rc.p.Exists(key).Result()
 	if err != nil {
 		return false
 	}
-	return v
+	if val == 1 {
+		return true
+	}
+	return false
 }
 
 // Incr increase counter in redis.
 func (rc *Cache) Incr(key string) error {
-	_, err := redis.Bool(rc.do("INCRBY", key, 1))
-	return err
+	return rc.p.Incr(key).Err()
 }
 
 // Decr decrease counter in redis.
 func (rc *Cache) Decr(key string) error {
-	_, err := redis.Bool(rc.do("INCRBY", key, -1))
-	return err
+	return rc.p.Decr(key).Err()
 }
 
 // ClearAll clean all cache in redis. delete this redis collection.
 func (rc *Cache) ClearAll() error {
-	c := rc.p.Get()
-	defer c.Close()
-	cachedKeys, err := redis.Strings(c.Do("KEYS", rc.key+":*"))
-	if err != nil {
-		return err
-	}
-	for _, str := range cachedKeys {
-		if _, err = c.Do("DEL", str); err != nil {
-			return err
-		}
-	}
-	return err
+	return rc.p.FlushAll().Err()
 }
 
 // StartAndGC start redis cache adapter.
@@ -172,84 +144,26 @@ func (rc *Cache) StartAndGC(config string) error {
 	if _, ok := cf["password"]; !ok {
 		cf["password"] = ""
 	}
-
-	if _, ok := cf["master"]; !ok {
-		cf["master"] = "mymaster"
-	}
-
-	rc.master = cf["master"]
 	rc.key = cf["key"]
 	rc.conninfo = cf["conn"]
 	rc.dbNum, _ = strconv.Atoi(cf["dbNum"])
 	rc.password = cf["password"]
 
 	rc.connectInit()
+	_, err := rc.p.Ping().Result()
+	return err
 
-	c := rc.p.Get()
-	defer c.Close()
-
-	return c.Err()
 }
 
 // connect to redis.
 func (rc *Cache) connectInit() {
-	var conn []string
-	if strings.Contains(rc.conninfo, ",") {
-		conn = strings.Split(rc.conninfo, ",")
-
-	} else {
-
-		conn = []string{rc.conninfo}
-	}
-	sntnl := &sentinel.Sentinel{
-		Addrs:      conn,
-		MasterName: rc.master,
-		Dial: func(addr string) (redis.Conn, error) {
-			timeout := 500 * time.Millisecond
-			c, err := redis.DialTimeout("tcp", addr, timeout, timeout, timeout)
-			if err != nil {
-				return nil, err
-			}
-			return c, nil
-		},
-	}
-	rc.p = &redis.Pool{
-		MaxIdle:     3,
-		MaxActive:   64,
-		Wait:        true,
-		IdleTimeout: 240 * time.Second,
-		Dial: func() (redis.Conn, error) {
-			masterAddr, err := sntnl.MasterAddr()
-			if err != nil {
-				return nil, err
-			}
-			c, err := redis.Dial("tcp", masterAddr)
-			if err != nil {
-				return nil, err
-			}
-
-			if rc.password != "" {
-				if _, err := c.Do("AUTH", rc.password); err != nil {
-					c.Close()
-					return nil, err
-				}
-			}
-
-			_, selecterr := c.Do("SELECT", rc.dbNum)
-			if selecterr != nil {
-				c.Close()
-				return nil, selecterr
-			}
-			return c, nil
-		},
-		TestOnBorrow: func(c redis.Conn, t time.Time) error {
-			if !sentinel.TestRole(c, "master") {
-				return errors.New("Role check failed")
-			} else {
-				return nil
-			}
-		},
-	}
+	client := redis.NewClient(&redis.Options{
+		Addr:        rc.conninfo,
+		Password:    rc.password, // no password set
+		DB:          rc.dbNum,    // use default DB
+		IdleTimeout: 180 * time.Second,
+	})
+	rc.p = client
 }
 
 func init() {
